@@ -236,7 +236,7 @@ server=127.0.0.1#${STUBBY_PORT}
 conf-dir=${DNSMASQ_DIR}
 EOF
 
-    log "Reloading dnsmasq"
+    log "Restarting dnsmasq..."
     cmd "${DNSMASQ_INIT_PATH}" restart
 }
 
