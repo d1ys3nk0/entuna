@@ -41,39 +41,48 @@ is_package_installed() {
 }
 
 validate_inputs() {
-    [ -f "${DOMAIN_LIST}" ] || { log "DOMAIN_LIST file not found: ${DOMAIN_LIST}"; exit 1; }
+    [ -f "${DOMAIN_LIST}" ] || {
+        log "DOMAIN_LIST file not found: ${DOMAIN_LIST}"
+        exit 1
+    }
+
     case "${MARK_CODE}" in
-        0x[0-9a-fA-F]*)
-            ;;
-        *)
-            log "MARK_CODE should be hex (e.g. 0xffffaaa), got: ${MARK_CODE}"
-            exit 1
-            ;;
+    0x[0-9a-fA-F]*) ;;
+    *)
+        log "MARK_CODE should be hex (e.g. 0xffffaaa), got: ${MARK_CODE}"
+        exit 1
+        ;;
     esac
 }
 
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            --mark)
-                [ -n "${2:-}" ] || { log "--mark requires a value"; exit 1; }
-                MARK_CODE="$2"
-                shift 2
-                ;;
-            --domains)
-                [ -n "${2:-}" ] || { log "--domains requires a value"; exit 1; }
-                DOMAIN_LIST="$2"
-                shift 2
-                ;;
-            *)
-                log "Unknown option: $1"
-                usage
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        --mark)
+            [ -n "${2:-}" ] || {
+                log "--mark requires a value"
                 exit 1
-                ;;
+            }
+            MARK_CODE="$2"
+            shift 2
+            ;;
+        --domains)
+            [ -n "${2:-}" ] || {
+                log "--domains requires a value"
+                exit 1
+            }
+            DOMAIN_LIST="$2"
+            shift 2
+            ;;
+        *)
+            log "Unknown option: $1"
+            usage
+            exit 1
+            ;;
         esac
     done
 }
