@@ -25,9 +25,16 @@ TUN_IPSET_NAME="wgrd"
 
 STATE_DIR="/opt/etc/entuna"
 STATE_FILE="${STATE_DIR}/state"
+WATCHDOG_SCRIPT="${STATE_DIR}/watchdog.sh"
+WATCHDOG_INIT_PATH="/opt/etc/init.d/S99entuna-watchdog"
+WATCHDOG_PIDFILE="/opt/var/run/entuna-watchdog.pid"
 
 MARK_CODE=${MARK_CODE:-}
 DOMAIN_LIST=${DOMAIN_LIST:-}
+ENTUNA_TUNNEL_IFACES=${ENTUNA_TUNNEL_IFACES:-}
+ENTUNA_CHECK_INTERVAL=${ENTUNA_CHECK_INTERVAL:-10}
+ENTUNA_CHECK_TIMEOUT=${ENTUNA_CHECK_TIMEOUT:-2}
+ENTUNA_CHECK_TARGET=${ENTUNA_CHECK_TARGET:-1.1.1.1}
 
 log() {
     echo "> ${*}"
@@ -46,7 +53,7 @@ cmd() {
 usage() {
     cat <<EOF
 Usage:
-  $0 install [--mark CODE] [--domains FILE]
+  $0 install [--mark CODE] [--domains FILE] [options]
   $0 uninstall
   $0 --help
 
@@ -60,15 +67,21 @@ EOF
 
 install_usage() {
     cat <<EOF
-Usage: $0 install [--mark CODE] [--domains FILE]
+Usage: $0 install [--mark CODE] [--domains FILE] [options]
 
 Options:
-  --mark CODE       WireGuard routing mark code, for example 0xffffaaa
-  --domains FILE    Path to the domain list file
-  -h, --help        Show this help
+  --mark CODE             WireGuard routing mark code, for example 0xffffaaa
+  --tunnel-ifaces LIST    Advanced: skip interface prompt and use this tunnel list
+  --check-interval SEC    Tunnel health check interval (default: 10)
+  --check-timeout SEC     Ping timeout for each tunnel check (default: 2)
+  --check-target HOST     Ping target for tunnel checks (default: 1.1.1.1)
+  --domains FILE          Path to the domain list file
+  -h, --help              Show this help
 
-MARK_CODE and DOMAIN_LIST environment variables are also supported.
-Missing values are prompted when a TTY is available.
+MARK_CODE, ENTUNA_TUNNEL_IFACES, ENTUNA_CHECK_INTERVAL, ENTUNA_CHECK_TIMEOUT,
+ENTUNA_CHECK_TARGET, and DOMAIN_LIST environment variables are also supported.
+Missing mark and tunnel interface values are discovered and prompted when a TTY is available.
+Use ENTUNA_TUNNEL_IFACES only for non-interactive installs or to skip the prompt.
 EOF
 }
 
@@ -97,7 +110,12 @@ read_input() {
     fi
 
     echo
-    die "No TTY available. Set MARK_CODE and DOMAIN_LIST or pass --mark and --domains."
+    die "No TTY available. Pass required install values as options or environment variables."
+}
+
+has_tty() {
+    [ -t 0 ] && return 0
+    ( : </dev/tty ) 2>/dev/null
 }
 
 is_package_installed() {
@@ -202,6 +220,7 @@ restore_or_remove_generated_file() {
 
 validate_install_inputs() {
     [ -n "${MARK_CODE}" ] || die "MARK_CODE is required."
+    [ -n "${ENTUNA_TUNNEL_IFACES}" ] || die "ENTUNA_TUNNEL_IFACES is required."
     [ -n "${DOMAIN_LIST}" ] || die "DOMAIN_LIST is required."
     [ -r "${DOMAIN_LIST}" ] || die "Domain list file is not readable: ${DOMAIN_LIST}"
 
@@ -215,6 +234,38 @@ validate_install_inputs() {
         die "MARK_CODE should be hex, for example 0xffffaaa; got: ${MARK_CODE}"
         ;;
     esac
+
+    case "${ENTUNA_CHECK_INTERVAL}" in
+    *[!0-9]* | "")
+        die "ENTUNA_CHECK_INTERVAL should be a positive integer; got: ${ENTUNA_CHECK_INTERVAL}"
+        ;;
+    0)
+        die "ENTUNA_CHECK_INTERVAL should be greater than zero."
+        ;;
+    esac
+
+    case "${ENTUNA_CHECK_TIMEOUT}" in
+    *[!0-9]* | "")
+        die "ENTUNA_CHECK_TIMEOUT should be a positive integer; got: ${ENTUNA_CHECK_TIMEOUT}"
+        ;;
+    0)
+        die "ENTUNA_CHECK_TIMEOUT should be greater than zero."
+        ;;
+    esac
+
+    case "${ENTUNA_CHECK_TARGET}" in
+    *[!A-Za-z0-9_.:-]* | "")
+        die "ENTUNA_CHECK_TARGET should be an IP address or hostname without whitespace; got: ${ENTUNA_CHECK_TARGET}"
+        ;;
+    esac
+
+    for iface in ${ENTUNA_TUNNEL_IFACES}; do
+        case "${iface}" in
+        *[!A-Za-z0-9_.:-]* | "")
+            die "Tunnel interface names may contain only letters, digits, '.', '_', ':', and '-'; got: ${iface}"
+            ;;
+        esac
+    done
 }
 
 iptables_mangle_rules() {
@@ -227,11 +278,24 @@ iptables_mangle_rules() {
 }
 
 validate_mark_code_is_configured() {
-    if ! command -v iptables >/dev/null 2>&1; then
-        die "iptables not found; cannot validate MARK_CODE."
+    if ! command -v ip >/dev/null 2>&1; then
+        die "ip command not found; cannot validate MARK_CODE."
     fi
 
-    if iptables_mangle_rules | awk -v mark="${MARK_CODE}" -v entuna_chain="${ENTUNA_CHAIN}" -v legacy_chain="${LEGACY_CHAIN}" '
+    if ip rule show 2>/dev/null | awk -v mark="${MARK_CODE}" '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "fwmark" && $(i + 1) == mark) {
+                    found = 1
+                }
+            }
+        }
+        END {
+            exit found ? 0 : 1
+        }
+    '; then
+        log "Validated MARK_CODE ${MARK_CODE} in existing policy routing rules."
+    elif iptables_mangle_rules | awk -v mark="${MARK_CODE}" -v entuna_chain="${ENTUNA_CHAIN}" -v legacy_chain="${LEGACY_CHAIN}" '
         /^Chain / {
             current_chain = $2
             next
@@ -245,18 +309,188 @@ validate_mark_code_is_configured() {
     '; then
         log "Validated MARK_CODE ${MARK_CODE} in existing mangle rules."
     else
-        die "MARK_CODE ${MARK_CODE} was not found in existing non-Entuna mangle rules. Configure the WireGuard policy first, then use its mark code."
+        die "MARK_CODE ${MARK_CODE} was not found in existing policy routing or non-Entuna mangle rules. Configure the WireGuard policy first, then use its mark code."
     fi
 }
 
-prompt_install_inputs() {
-    if [ -z "${MARK_CODE}" ]; then
+normalize_iface_list() {
+    printf '%s\n' "$1" | tr ',' ' ' | awk '{
+        for (i = 1; i <= NF; i++) {
+            printf "%s%s", sep, $i
+            sep = " "
+        }
+    }
+    END {
+        printf "\n"
+    }'
+}
+
+discover_mark_codes() {
+    command -v ip >/dev/null 2>&1 || return 0
+    ip rule show 2>/dev/null | awk '{
+        for (i = 1; i <= NF; i++) {
+            if ($i == "fwmark" && $(i + 1) ~ /^0x[0-9a-fA-F]+$/) {
+                print $(i + 1)
+            }
+        }
+    }' | sort -u
+}
+
+discover_interfaces() {
+    command -v ip >/dev/null 2>&1 || return 0
+    ip link show 2>/dev/null | awk -F': ' '/^[0-9]+: / {
+        name = $2
+        sub(/@.*/, "", name)
+        print name
+    }'
+}
+
+discover_interfaces_ordered() {
+    interfaces=$(discover_interfaces)
+
+    for iface in ${interfaces}; do
+        case "${iface}" in
+        nwg* | wg* | tun* | xfrm*)
+            printf '%s\n' "${iface}"
+            ;;
+        esac
+    done
+
+    for iface in ${interfaces}; do
+        case "${iface}" in
+        nwg* | wg* | tun* | xfrm*) ;;
+        *)
+            printf '%s\n' "${iface}"
+            ;;
+        esac
+    done
+}
+
+interface_local_addresses() {
+    iface=$1
+
+    command -v ip >/dev/null 2>&1 || {
+        printf '%s\n' "-"
+        return 0
+    }
+
+    ip route show table local 2>/dev/null | awk -v iface="${iface}" '
+        $0 ~ (" dev " iface " ") {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "local") {
+                    printf "%s%s", sep, $(i + 1)
+                    sep = ","
+                }
+            }
+        }
+        END {
+            if (sep == "") {
+                printf "-"
+            }
+            printf "\n"
+        }
+    '
+}
+
+interface_flags() {
+    iface=$1
+
+    command -v ip >/dev/null 2>&1 || {
+        printf '%s\n' "-"
+        return 0
+    }
+
+    ip link show dev "${iface}" 2>/dev/null | sed -n '1s/.*<\([^>]*\)>.*/\1/p'
+}
+
+selection_value() {
+    choice=$1
+    shift
+
+    case "${choice}" in
+    *[!0-9]* | "")
+        printf '%s\n' "${choice}"
+        return 0
+        ;;
+    esac
+
+    index=1
+    for item in "$@"; do
+        if [ "${choice}" = "${index}" ]; then
+            printf '%s\n' "${item}"
+            return 0
+        fi
+        index=$((index + 1))
+    done
+
+    printf '%s\n' "${choice}"
+}
+
+prompt_mark_code() {
+    [ -z "${MARK_CODE}" ] || return 0
+    has_tty || die "MARK_CODE is required in non-interactive mode. Pass --mark CODE or set MARK_CODE."
+
+    marks=$(discover_mark_codes)
+    if [ -n "${marks}" ]; then
+        log "Discovered routing mark candidates:"
+        index=1
+        for mark in ${marks}; do
+            printf '  %s) %s\n' "${index}" "${mark}"
+            ip rule show 2>/dev/null | awk -v mark="${mark}" '
+                {
+                    for (i = 1; i <= NF; i++) {
+                        if ($i == "fwmark" && $(i + 1) == mark) {
+                            print "     " $0
+                        }
+                    }
+                }
+            '
+            index=$((index + 1))
+        done
+        mark_choice=
+        read_input "Choose mark number or enter mark code: " mark_choice
+        # shellcheck disable=SC2086
+        MARK_CODE=$(selection_value "${mark_choice}" ${marks})
+    else
+        log "No fwmark entries found in policy routing rules."
         read_input "Enter mark code: " MARK_CODE
     fi
+}
 
+prompt_tunnel_ifaces() {
+    ENTUNA_TUNNEL_IFACES=$(normalize_iface_list "${ENTUNA_TUNNEL_IFACES}")
+    [ -z "${ENTUNA_TUNNEL_IFACES}" ] || return 0
+    has_tty || die "ENTUNA_TUNNEL_IFACES is required in non-interactive mode. Pass --tunnel-ifaces LIST or set ENTUNA_TUNNEL_IFACES."
+
+    interfaces=$(discover_interfaces_ordered)
+    if [ -n "${interfaces}" ]; then
+        log "Discovered interfaces; likely tunnel interfaces are listed first:"
+        index=1
+        for iface in ${interfaces}; do
+            flags=$(interface_flags "${iface}")
+            addresses=$(interface_local_addresses "${iface}")
+            printf '  %s) %s flags=%s local=%s\n' "${index}" "${iface}" "${flags:-"-"}" "${addresses}"
+            index=$((index + 1))
+        done
+        iface_choice=
+        read_input "Choose tunnel interface number or enter interface name/list: " iface_choice
+        # shellcheck disable=SC2086
+        ENTUNA_TUNNEL_IFACES=$(selection_value "${iface_choice}" ${interfaces})
+    else
+        log "No interfaces discovered from ip link."
+        read_input "Enter tunnel interface name/list: " ENTUNA_TUNNEL_IFACES
+    fi
+
+    ENTUNA_TUNNEL_IFACES=$(normalize_iface_list "${ENTUNA_TUNNEL_IFACES}")
+}
+
+prompt_install_inputs() {
     if [ -z "${DOMAIN_LIST}" ]; then
         read_input "Enter domain list file path: " DOMAIN_LIST
     fi
+
+    prompt_mark_code
+    prompt_tunnel_ifaces
 }
 
 parse_install_args() {
@@ -269,6 +503,26 @@ parse_install_args() {
         --mark)
             [ -n "${2:-}" ] || die "--mark requires a value"
             MARK_CODE=$2
+            shift 2
+            ;;
+        --tunnel-ifaces)
+            [ -n "${2:-}" ] || die "--tunnel-ifaces requires a value"
+            ENTUNA_TUNNEL_IFACES=$2
+            shift 2
+            ;;
+        --check-interval)
+            [ -n "${2:-}" ] || die "--check-interval requires a value"
+            ENTUNA_CHECK_INTERVAL=$2
+            shift 2
+            ;;
+        --check-timeout)
+            [ -n "${2:-}" ] || die "--check-timeout requires a value"
+            ENTUNA_CHECK_TIMEOUT=$2
+            shift 2
+            ;;
+        --check-target)
+            [ -n "${2:-}" ] || die "--check-target requires a value"
+            ENTUNA_CHECK_TARGET=$2
             shift 2
             ;;
         --domains)
@@ -418,18 +672,22 @@ set -eu
 
 ENTUNA_CHAIN="${ENTUNA_CHAIN}"
 TUN_IPSET_NAME="${TUN_IPSET_NAME}"
-MARK_CODE="${MARK_CODE}"
+WATCHDOG_SCRIPT="${WATCHDOG_SCRIPT}"
 
 echo "Create ipset to be used by dnsmasq"
 ipset create "\${TUN_IPSET_NAME}" hash:net -exist
 
-echo "Create Entuna chain to mark packets for policy routing"
+echo "Create Entuna chain for policy routing"
 iptables -t mangle -L "\${ENTUNA_CHAIN}" >/dev/null 2>&1 || iptables -t mangle -N "\${ENTUNA_CHAIN}"
-iptables -t mangle -C "\${ENTUNA_CHAIN}" -j MARK --set-mark "\${MARK_CODE}" 2>/dev/null || iptables -t mangle -A "\${ENTUNA_CHAIN}" -j MARK --set-mark "\${MARK_CODE}"
-iptables -t mangle -C "\${ENTUNA_CHAIN}" -j CONNMARK --save-mark --nfmask 0xffffffff --ctmask 0xffffffff 2>/dev/null || iptables -t mangle -A "\${ENTUNA_CHAIN}" -j CONNMARK --save-mark --nfmask 0xffffffff --ctmask 0xffffffff
+iptables -t mangle -F "\${ENTUNA_CHAIN}"
+iptables -t mangle -A "\${ENTUNA_CHAIN}" -j RETURN
 
 echo "Route matching ipset destinations through Entuna chain"
 iptables -t mangle -C PREROUTING -m set --match-set "\${TUN_IPSET_NAME}" dst -j "\${ENTUNA_CHAIN}" 2>/dev/null || iptables -t mangle -A PREROUTING -m set --match-set "\${TUN_IPSET_NAME}" dst -j "\${ENTUNA_CHAIN}"
+
+if [ -x "\${WATCHDOG_SCRIPT}" ]; then
+    "\${WATCHDOG_SCRIPT}" apply || true
+fi
 EOF
     cmd chmod +x "${IPTABLES_SCRIPT}"
 
@@ -448,6 +706,194 @@ EOF
     cmd sh "${IPTABLES_SCRIPT}"
 }
 
+install_watchdog() {
+    log "Writing Entuna watchdog script to ${WATCHDOG_SCRIPT}"
+    write_managed_script "${WATCHDOG_SCRIPT}" <<EOF
+set -eu
+
+ENTUNA_CHAIN="${ENTUNA_CHAIN}"
+MARK_CODE="${MARK_CODE}"
+ENTUNA_TUNNEL_IFACES="${ENTUNA_TUNNEL_IFACES}"
+ENTUNA_CHECK_INTERVAL="${ENTUNA_CHECK_INTERVAL}"
+ENTUNA_CHECK_TIMEOUT="${ENTUNA_CHECK_TIMEOUT}"
+ENTUNA_CHECK_TARGET="${ENTUNA_CHECK_TARGET}"
+
+log_state()
+{
+        if command -v logger >/dev/null 2>&1
+        then
+                logger -t entuna-watchdog "\$*"
+        else
+                echo "entuna-watchdog: \$*"
+        fi
+}
+
+set_mode()
+{
+        mode=\$1
+
+        iptables -t mangle -L "\$ENTUNA_CHAIN" >/dev/null 2>&1 || iptables -t mangle -N "\$ENTUNA_CHAIN"
+        iptables -t mangle -F "\$ENTUNA_CHAIN"
+
+        case "\$mode" in
+                tunnel)
+                        iptables -t mangle -A "\$ENTUNA_CHAIN" -j MARK --set-mark "\$MARK_CODE"
+                        iptables -t mangle -A "\$ENTUNA_CHAIN" -j CONNMARK --save-mark --nfmask 0xffffffff --ctmask 0xffffffff
+                        ;;
+                direct)
+                        iptables -t mangle -A "\$ENTUNA_CHAIN" -j RETURN
+                        ;;
+                *)
+                        echo "Unknown mode: \$mode"
+                        exit 1
+                        ;;
+        esac
+}
+
+iface_is_up()
+{
+        ip link show dev "\$1" 2>/dev/null | sed -n '1p' | grep -q '<.*UP'
+}
+
+iface_is_alive()
+{
+        iface=\$1
+
+        iface_is_up "\$iface" || return 1
+        ping -I "\$iface" -c 1 -W "\$ENTUNA_CHECK_TIMEOUT" "\$ENTUNA_CHECK_TARGET" >/dev/null 2>&1
+}
+
+health_mode()
+{
+        for iface in \$ENTUNA_TUNNEL_IFACES
+        do
+                if iface_is_alive "\$iface"
+                then
+                        printf '%s\n' tunnel
+                        return 0
+                fi
+        done
+
+        printf '%s\n' direct
+}
+
+apply_mode()
+{
+        mode=\$(health_mode)
+        set_mode "\$mode"
+        printf '%s\n' "\$mode"
+}
+
+loop()
+{
+        last_mode=""
+
+        while :
+        do
+                mode=\$(health_mode)
+                set_mode "\$mode"
+
+                if [ "\$mode" != "\$last_mode" ]
+                then
+                        log_state "mode=\$mode mark=\$MARK_CODE interfaces=\$ENTUNA_TUNNEL_IFACES target=\$ENTUNA_CHECK_TARGET"
+                        last_mode=\$mode
+                fi
+
+                sleep "\$ENTUNA_CHECK_INTERVAL"
+        done
+}
+
+case "\${1:-loop}" in
+        apply)
+                apply_mode >/dev/null
+                ;;
+        direct)
+                set_mode direct
+                ;;
+        loop)
+                loop
+                ;;
+        *)
+                echo "Usage: \$0 {apply|direct|loop}"
+                exit 1
+                ;;
+esac
+EOF
+    cmd chmod +x "${WATCHDOG_SCRIPT}"
+
+    log "Writing Entuna watchdog init script to ${WATCHDOG_INIT_PATH}"
+    write_managed_script "${WATCHDOG_INIT_PATH}" <<EOF
+set -eu
+
+WATCHDOG="${WATCHDOG_SCRIPT}"
+PIDFILE="${WATCHDOG_PIDFILE}"
+
+watchdog_status()
+{
+        [ -f "\$PIDFILE" ] || return 1
+        pid=\$(cat "\$PIDFILE" 2>/dev/null || true)
+        [ -n "\$pid" ] && [ -d "/proc/\$pid" ]
+}
+
+start()
+{
+        if watchdog_status
+        then
+                echo entuna-watchdog already running
+                return 0
+        fi
+
+        mkdir -p "\$(dirname "\$PIDFILE")"
+        "\$WATCHDOG" apply || true
+        "\$WATCHDOG" loop >/dev/null 2>&1 &
+        echo \$! > "\$PIDFILE"
+}
+
+stop()
+{
+        if watchdog_status
+        then
+                kill "\$(cat "\$PIDFILE")" 2>/dev/null || true
+        else
+                echo entuna-watchdog is not running
+        fi
+
+        rm -f "\$PIDFILE"
+        [ -x "\$WATCHDOG" ] && "\$WATCHDOG" direct || true
+}
+
+case "\${1:-}" in
+        start)
+                start
+                ;;
+        stop)
+                stop
+                ;;
+        status)
+                if watchdog_status
+                then
+                        echo entuna-watchdog is running
+                else
+                        echo entuna-watchdog is not running
+                        exit 1
+                fi
+                ;;
+        restart)
+                stop
+                start
+                ;;
+        *)
+                echo "Usage: \$0 {start|stop|restart|status}"
+                exit 1
+                ;;
+esac
+EOF
+    cmd chmod +x "${WATCHDOG_INIT_PATH}"
+
+    log "Starting Entuna watchdog"
+    cmd "${WATCHDOG_INIT_PATH}" restart
+}
+
 write_state() {
     log "Writing Entuna state to ${STATE_FILE}"
     write_managed_file "${STATE_FILE}" <<EOF
@@ -455,6 +901,10 @@ mark_code=${MARK_CODE}
 domain_list=${DOMAIN_LIST}
 ipset=${TUN_IPSET_NAME}
 chain=${ENTUNA_CHAIN}
+tunnel_ifaces=${ENTUNA_TUNNEL_IFACES}
+check_interval=${ENTUNA_CHECK_INTERVAL}
+check_timeout=${ENTUNA_CHECK_TIMEOUT}
+check_target=${ENTUNA_CHECK_TARGET}
 EOF
 }
 
@@ -518,6 +968,18 @@ stop_managed_stubby() {
     fi
 }
 
+stop_managed_watchdog() {
+    if is_managed_file "${WATCHDOG_INIT_PATH}" && [ -x "${WATCHDOG_INIT_PATH}" ]; then
+        log "Stopping managed Entuna watchdog"
+        cmd "${WATCHDOG_INIT_PATH}" stop || true
+    elif is_managed_file "${WATCHDOG_SCRIPT}" && [ -x "${WATCHDOG_SCRIPT}" ]; then
+        log "Switching Entuna watchdog state to direct mode"
+        cmd "${WATCHDOG_SCRIPT}" direct || true
+    else
+        log "No managed Entuna watchdog to stop."
+    fi
+}
+
 restart_dnsmasq_after_uninstall() {
     if [ -x "${DNSMASQ_INIT_PATH}" ]; then
         log "Restarting dnsmasq"
@@ -530,18 +992,23 @@ restart_dnsmasq_after_uninstall() {
 install_command() {
     parse_install_args "$@"
     prompt_install_inputs
+    ENTUNA_TUNNEL_IFACES=$(normalize_iface_list "${ENTUNA_TUNNEL_IFACES}")
     validate_install_inputs
     validate_mark_code_is_configured
     install_stubby
     install_dnsmasq
     install_iptables
+    install_watchdog
     write_state
 }
 
 uninstall_command() {
     parse_uninstall_args "$@"
+    stop_managed_watchdog
     stop_managed_stubby
     uninstall_iptables
+    restore_or_remove_generated_file "${WATCHDOG_INIT_PATH}"
+    restore_or_remove_generated_file "${WATCHDOG_SCRIPT}"
     restore_or_remove_generated_file "${IPTABLES_RELOAD_HOOK}"
     restore_or_remove_generated_file "${IPTABLES_SCRIPT}"
     restore_or_remove_generated_file "${DNSMASQ_LIST_PATH}"
