@@ -22,6 +22,7 @@ Entware should already be installed.
 - Move one of your devices to the `WG` group.
 - Run: `ssh -p 65022 root@192.168.1.1 iptables -t mangle -L | grep 0xffff` to get the mark code.
 - Move the device back to `Default policy`.
+- The installer validates that the mark code already exists in the router's non-Entuna mangle rules before applying Entuna config.
 
 ## Prepare the domain list for tunneling
 
@@ -43,16 +44,24 @@ curl -fsSL https://raw.githubusercontent.com/d1ys3nk0/entuna/main/setup.sh -o en
 
 ```sh
 # Using environment variables
-DOMAIN_LIST=proxy.lst MARK_CODE=0xffffaaa ./entuna.sh
+DOMAIN_LIST=proxy.lst MARK_CODE=0xffffaaa ./entuna.sh install
 
 # Using command-line flags
-./entuna.sh --mark 0xffffaaa --domains proxy.lst
+./entuna.sh install --mark 0xffffaaa --domains proxy.lst
 
-# Interactive (prompts for mark code and domain list when run without args)
-./entuna.sh
+# Interactive (prompts for mark code and domain list)
+./entuna.sh install
 ```
 
+The mark code is required; Entuna does not provide a default.
+
 Run `./entuna.sh --help` for usage.
+
+To remove Entuna managed config, hooks, iptables rules, and ipset state without removing packages or your domain list, run:
+
+```sh
+./entuna.sh uninstall
+```
 
 ## Configure DNS
 
